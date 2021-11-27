@@ -1,21 +1,26 @@
 using System;
-using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Cache;
 using System.Net.NetworkInformation;
 using System.Reflection;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using Newtonsoft.Json;
-using Sentry;
+using Onova;
+using Onova.Services;
 using StreamingRespirator.Core.Streaming;
 
 namespace StreamingRespirator.Core
 {
     internal static class Program
     {
+#if DEBUG
+        public const string MutexName = "{5FF75362-95BA-4399-8C77-C1A0C5B8A292}";
+#else
         public const string MutexName = "{5FF75362-95BA-4399-8C77-C1A0C5B8A291}";
+#endif
 
         public static readonly string ConfigPath = Path.ChangeExtension(Application.ExecutablePath, ".cnf");
 
@@ -62,57 +67,51 @@ namespace StreamingRespirator.Core
 
                 CrashReport.Init();
 
-                if (Assembly.GetExecutingAssembly().GetName().Version.ToString() != "0.0.0.0" && !CheckUpdate())
-                {
-                    return;
-                }
-
                 if (!Certificates.InstallCACertificates())
                 {
                     MessageBox.Show(Lang.CertificateError, Lang.Name, MessageBoxButtons.OK, MessageBoxIcon.Exclamation);
                     return;
                 }
 
-                RespiratorServer server;
-                try
+                Config.Load();
+                using (var context = new MainContext())
                 {
-                    server = new RespiratorServer();
-                }
-                catch (Exception ex)
-                {
-                    SentrySdk.CaptureException(ex);
-
-                    MessageBox.Show(Lang.StartError, Lang.Name, MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    return;
-                }
-
-                using (server)
-                {
-                    Application.Run(new MainContext(server));
+                    Application.Run(context);
                     Config.Save();
                 }
             }
         }
 
-        static bool CheckUpdate()
+        public static async void CheckUpdate(ApplicationContext context)
         {
-            if (GithubLatestRelease.CheckNewVersion())
+            if (Assembly.GetExecutingAssembly().GetName().Version.ToString() != "0.0.0.0")
             {
-                MessageBox.Show(Lang.NewUpdate, Lang.Name, MessageBoxButtons.OK, MessageBoxIcon.Information);
-
-                try
+                using (var manager = new UpdateManager(new GithubPackageResolver("RyuaNerin", "StreamingRespirator", "*.exe"), new ExecutablePackageExtractor()))
                 {
-                    Process.Start("https://github.com/RyuaNerin/StreamingRespirator/blob/master/README.md")?.Dispose();
-                }
-                catch (Exception ex)
-                {
-                    SentrySdk.CaptureException(ex);
-                }
+                    var r = await manager.CheckForUpdatesAsync();
 
-                return false;
+                    if (r.CanUpdate)
+                    {
+                        await manager.PrepareUpdateAsync(r.LastVersion);
+
+                        manager.LaunchUpdater(r.LastVersion, true);
+
+                        if (MessageBox.Show(Lang.NewUpdate, Lang.Name, MessageBoxButtons.OKCancel, MessageBoxIcon.Information) == DialogResult.Cancel)
+                            return;
+
+                        context.ExitThread();
+                    }
+                }
             }
+        }
 
-            return true;
+        private class ExecutablePackageExtractor : IPackageExtractor
+        {
+            public Task ExtractPackageAsync(string sourceFilePath, string destDirPath, IProgress<double> progress = null, CancellationToken cancellationToken = default)
+            {
+                File.Copy(sourceFilePath, Path.Combine(destDirPath, Path.GetFileName(Application.ExecutablePath)));
+                return Task.CompletedTask;
+            }
         }
     }
 }

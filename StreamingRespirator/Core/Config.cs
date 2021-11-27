@@ -1,7 +1,7 @@
 using System;
+using System.Globalization;
 using System.IO;
 using System.Text;
-using System.Threading;
 using Newtonsoft.Json;
 using Sentry;
 using StreamingRespirator.Core.Streaming;
@@ -10,9 +10,9 @@ namespace StreamingRespirator.Core
 {
     internal class Config
     {
-        public static Config Instance { get; }
+        public static Config Instance { get; private set; }
 
-        static Config()
+        public static void Load()
         {
             try
             {
@@ -24,22 +24,28 @@ namespace StreamingRespirator.Core
                     Instance = inst;
                 }
             }
+            catch (FileNotFoundException)
+            {
+            }
+            catch (DirectoryNotFoundException)
+            {
+            }
             catch (Exception ex)
             {
                 SentrySdk.CaptureException(ex);
-
-                Instance = new Config();
             }
+
+            Instance = Instance ?? new Config();
 
             TwitterClientFactory.SetInstances(Instance.Accounts);
 
-            Interlocked.Exchange(ref Load, 1);
+            Loaded = true;
         }
 
-        private static long Load = 0;
+        private static volatile bool Loaded;
         public static void Save()
         {
-            if (Interlocked.Read(ref Load) == 0)
+            if (!Loaded)
                 return;
 
             TwitterClientFactory.CopyInstances(Instance.Accounts);
@@ -52,12 +58,24 @@ namespace StreamingRespirator.Core
                     Program.JsonSerializer.Serialize(writer, Instance);
                 }
             }
+            catch (FileNotFoundException)
+            {
+            }
+            catch (DirectoryNotFoundException)
+            {
+            }
             catch (Exception ex)
             {
                 SentrySdk.CaptureException(ex);
             }
         }
 
+        private Config()
+        {
+        }
+
+        [JsonIgnore]
+        public object Lock { get; } = new object();
 
         [JsonProperty("accounts")]
         public TwitterCredentialList Accounts { get; } = new TwitterCredentialList();
@@ -88,6 +106,11 @@ namespace StreamingRespirator.Core
         {
             [JsonProperty("port")]
             public int Port { get; set; } = 8811;
+
+            [JsonProperty("id")]
+            public string Id { get; set; }
+            [JsonProperty("pw")]
+            public string Pw { get; set; }
         }
     }
 }

@@ -48,18 +48,50 @@ namespace StreamingRespirator.Core.Streaming.TimeLines
                     {
                         foreach (var user in activity.Sources)
                             lstUsers.Add(user);
+                        foreach (var user in activity.Targets)
+                        {
+                            try
+                            {
+                                var u = user.ToObject<TwitterUser>();
+                                lstUsers.Add(u);
+                            }
+                            catch
+                            {
+                            }
+                        }
 
-                        foreach (var tweet in activity.Targets)
+                        foreach (var tweet in activity.TargetObjects)
                             tweet.AddUserToHashSet(lstUsers);
 
-                        if ((Config.Instance.Filter.ShowRetweetedMyStatus && activity.Action == "retweet")
-                            || (Config.Instance.Filter.ShowRetweetWithComment && activity.Action == "quote")
-                            || activity.Action == "reply")
+                        var add = false;
+                        switch (activity.Action)
                         {
-                            foreach (var tweet in activity.Targets)
-                            {
-                                lstItems.Add(tweet);
-                            }
+                            case "retweet" when Config.Instance.Filter.ShowRetweetedMyStatus:
+                            case "quote" when Config.Instance.Filter.ShowRetweetWithComment:
+                            case "reply":
+                                foreach (var tweet in activity.Targets)
+                                {
+                                    try
+                                    {
+                                        var s = tweet.ToObject<TwitterStatus>();
+                                        lstItems.Add(s);
+                                    }
+                                    catch
+                                    {
+                                    }
+                                }
+                                break;
+
+                            case "mention":
+                                foreach (var tweet in activity.TargetObjects)
+                                {
+                                    lstItems.Add(tweet);
+                                }
+                                break;
+                        }
+
+                        if (add)
+                        {
                         }
                     }
 

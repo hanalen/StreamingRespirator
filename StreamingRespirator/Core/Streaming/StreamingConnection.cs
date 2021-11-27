@@ -3,7 +3,6 @@ using System.Diagnostics;
 using System.IO;
 using System.Text;
 using System.Threading;
-using Newtonsoft.Json;
 
 namespace StreamingRespirator.Core.Streaming
 {
@@ -77,7 +76,14 @@ namespace StreamingRespirator.Core.Streaming
                 {
                     this.Stream.Close();
                 }
-                this.m_keepAlive.Change(KeepAlivePeriod, KeepAlivePeriod);
+
+                try
+                {
+                    this.m_keepAlive.Change(KeepAlivePeriod, KeepAlivePeriod);
+                }
+                catch
+                {
+                }
             }
         }
 
@@ -96,7 +102,6 @@ namespace StreamingRespirator.Core.Streaming
                 {
                     Program.JsonSerializer.Serialize(this.m_streamWriter, data);
                     this.m_streamWriter.WriteLine();
-                    this.m_streamWriter.WriteLine();
                     this.m_streamWriter.Flush();
                 }
                 catch
@@ -104,7 +109,13 @@ namespace StreamingRespirator.Core.Streaming
                     this.Stream.Close();
                 }
 
-                this.m_keepAlive.Change(KeepAlivePeriod, KeepAlivePeriod);
+                try
+                {
+                    this.m_keepAlive.Change(KeepAlivePeriod, KeepAlivePeriod);
+                }
+                catch
+                {
+                }
             }
         }
     }

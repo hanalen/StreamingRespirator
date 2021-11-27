@@ -11,11 +11,11 @@ namespace StreamingRespirator.Core.Streaming.Proxy
     [DebuggerDisplay("{Method} {RequestUriRaw} {Version}")]
     internal sealed class ProxyRequest : IDisposable
     {
-        private readonly RequestStreamReader m_streamReader;
+        private readonly ProxyStream m_proxyStream;
 
         private ProxyRequest(Stream stream)
         {
-            this.m_streamReader = new RequestStreamReader(stream);
+            this.m_proxyStream = new ProxyStream(stream);
         }
         ~ProxyRequest()
         {
@@ -34,14 +34,13 @@ namespace StreamingRespirator.Core.Streaming.Proxy
 
             if (disposing)
             {
-                this.m_streamReader.Dispose();
                 this.RequestBodyReader?.Dispose();
             }
         }
 
         public string Method        { get; private set; }
         public string RequestUriRaw { get; private set; } // CONNECT 전용
-        public Uri    RequestUri    { get; private set; }
+        public Uri    RequestUri    { get; set; }
         public string Version       { get; private set; }
 
         public string RemoteHost { get; private set; }
@@ -54,12 +53,21 @@ namespace StreamingRespirator.Core.Streaming.Proxy
 
         public WebHeaderCollection Headers { get; } = new WebHeaderCollection();
 
-        public static ProxyRequest Parse(Stream proxyStream, bool isSsl)
+        public string ProxyAuthorization { get; private set; }
+        public bool KeepAlive { get; private set; }
+
+        public static bool TryParse(Stream proxyStream, bool isSsl, out ProxyRequest req)
         {
-            var req = new ProxyRequest(proxyStream);
+            req = new ProxyRequest(proxyStream);
             while (true)
             {
-                var firstLine = req.m_streamReader.ReadLine();
+                var firstLine = req.m_proxyStream.ReadLine();
+                if (firstLine == null)
+                {
+                    req.Dispose();
+                    req = null;
+                    return false;
+                }
 
                 try
                 {
@@ -75,32 +83,21 @@ namespace StreamingRespirator.Core.Streaming.Proxy
                 }
                 catch
                 {
+                    throw;
                 }
             }
 
             string line;
-            while ((line = req.m_streamReader.ReadLine()) != null)
+            while ((line = req.m_proxyStream.ReadLine()) != null)
             {
                 if (string.IsNullOrEmpty(line))
                 {
                     break;
                 }
-                if (line.IndexOf("\r\n") > -1)
-                {
-                    var lines = line.Split(new[] { Environment.NewLine }, StringSplitOptions.None);
-                    for (int i = 0; i < lines.Length; i++)
-                    {
-                        var index = lines[i].IndexOf(':');
-                        string key = lines[i].Substring(0, index);
-                        string value = lines[i].Substring(index + 1).Trim();
-                        req.Headers.Add(key, value);
-                    }
-                }
-                else
-                {
-                    var i = line.IndexOf(':');
-                    req.Headers.Add(line.Substring(0, i), line.Substring(i + 1).Trim());
-                }
+
+                var i = line.IndexOf(':');
+
+                req.Headers.Add(line.Substring(0, i), line.Substring(i + 1).Trim());
             }
 
             req.RemoteHost = req.Method == "CONNECT" ? req.RequestUriRaw : req.Headers.Get("Host");
@@ -133,12 +130,22 @@ namespace StreamingRespirator.Core.Streaming.Proxy
                 req.RequestBodyReader = new ProxyRequestBody(req);
             }
 
-            return req;
+            req.ProxyAuthorization = req.Headers[HttpRequestHeader.ProxyAuthorization];
+            req.Headers.Remove(HttpRequestHeader.ProxyAuthorization);
+
+            req.KeepAlive = (req.Headers["Proxy-Connection"] ?? req.Headers[HttpRequestHeader.Connection])?.Equals("Keep-Alive", StringComparison.OrdinalIgnoreCase) ?? false;
+            req.Headers.Remove("Proxy-Connection");
+
+            return true;
         }
 
-        public WebRequest CreateRequest(Func<string, Uri, WebRequest> create, bool copyAuthorization)
+        /// <summary>ProxyRequest → HttpWebRequest</summary>
+        /// <param name="create">베이스가 될 WebRequest 를 생성할 함수입니다. TwitterCredentials 를 위해 추가되었습니다.</param>
+        /// <param name="copyAuthorization">true일 때 authorization 헤더 복사</param>
+        /// <returns></returns>
+        public WebRequest CreateRequest(WebRequest baseWebRequest, bool copyAuthorization)
         {
-            var req = (create?.Invoke(this.Method, this.RequestUri) ?? WebRequest.Create(this.RequestUri)) as HttpWebRequest;
+            var req = (baseWebRequest ?? WebRequest.Create(this.RequestUri)) as HttpWebRequest;
             req.Method = this.Method;
 
             foreach (var key in this.Headers.AllKeys)
@@ -181,8 +188,6 @@ namespace StreamingRespirator.Core.Streaming.Proxy
 
                 writer.WriteLine($"{this.Method} {this.RequestUriRaw} {this.Version}");
 
-                this.Headers.Set("Connection", "close");
-
                 foreach (var key in this.Headers.AllKeys)
                 {
                     writer.WriteLine($"{key}: {this.Headers.Get(key)}");
@@ -194,6 +199,16 @@ namespace StreamingRespirator.Core.Streaming.Proxy
             }
 
             this.RequestBodyReader?.CopyTo(stream);
+        }
+
+        public IPEndPoint GetEndPoint()
+        {
+            if (!IPAddress.TryParse(this.RemoteHost, out IPAddress addr))
+            {
+                addr = Dns.GetHostAddresses(this.RemoteHost)[0];
+            }
+
+            return new IPEndPoint(addr, this.RemotePort);
         }
 
         private sealed class ProxyRequestBody : Stream
@@ -263,16 +278,16 @@ namespace StreamingRespirator.Core.Streaming.Proxy
                     {
                         this.m_chunkedBuffer.SetLength(0);
 
-                        var remain = int.Parse(this.m_request.m_streamReader.ReadLine(), NumberStyles.HexNumber);
+                        var remain = int.Parse(this.m_request.m_proxyStream.ReadLine(), NumberStyles.HexNumber);
 
                         while (remain > 0)
                         {
-                            read = this.m_request.m_streamReader.Read(buffer, offset, Math.Min(count, remain));
+                            read = this.m_request.m_proxyStream.Read(buffer, offset, Math.Min(count, remain));
                             this.m_chunkedBuffer.Write(buffer, offset, read);
 
                             remain -= read;
                         }
-                        this.m_request.m_streamReader.ReadLine();
+                        this.m_request.m_proxyStream.ReadLine();
 
                         read = this.m_chunkedBuffer.Read(buffer, offset, count);
                     }
@@ -281,7 +296,7 @@ namespace StreamingRespirator.Core.Streaming.Proxy
                 }
                 else
                 {
-                    read = this.m_request.m_streamReader.Read(buffer, offset, Math.Min(count, this.m_remainContentLength.Value));
+                    read = this.m_request.m_proxyStream.Read(buffer, offset, Math.Min(count, this.m_remainContentLength.Value));
 
                     this.m_remainContentLength -= read;
                     if (this.m_remainContentLength < 0)
@@ -292,7 +307,7 @@ namespace StreamingRespirator.Core.Streaming.Proxy
             }
 
             public override long Seek(long offset, SeekOrigin origin)
-                => this.m_request.m_streamReader.Seek(offset, origin);
+                => this.m_request.m_proxyStream.Seek(offset, origin);
 
             public override void Write(byte[] buffer, int offset, int count)
                 => throw new NotSupportedException();

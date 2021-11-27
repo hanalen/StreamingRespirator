@@ -175,7 +175,6 @@ namespace StreamingRespirator.Core.Streaming.TimeLines
                 }
                 else
                 {
-                    SentrySdk.CaptureException(webEx);
                     return TimeSpan.FromSeconds(WaitOnError);
                 }
             }
@@ -195,53 +194,100 @@ namespace StreamingRespirator.Core.Streaming.TimeLines
                     if (res.StatusCode == HttpStatusCode.OK)
                     {
                         using (var stream = res.GetResponseStream())
-                        using (var streamReader = new StreamReader(stream, Encoding.UTF8))
-                        using (var jsonReader = new JsonTextReader(streamReader))
                         {
-                            lock (this.m_cursorLock)
+#if DEBUG
+                            using (var buff = new MemoryStream(4096))
                             {
-                                var cursor = this.ParseHtml(Program.JsonSerializer.Deserialize<TApiResult>(jsonReader), setItems, setUsers, !this.m_firstRefresh);
-                                if (cursor != null)
-                                    this.Cursor = cursor;
+                                stream.CopyTo(buff);
+                                buff.Position = 0;
+
+                                lock (this.m_cursorLock)
+                                {
+                                    try
+                                    {
+                                        using (var streamReader = new StreamReader(buff, Encoding.UTF8))
+                                        using (var jsonReader = new JsonTextReader(streamReader))
+                                        {
+                                            var cursor = this.ParseHtml(Program.JsonSerializer.Deserialize<TApiResult>(jsonReader), setItems, setUsers, !this.m_firstRefresh);
+                                            if (cursor != null)
+                                                this.Cursor = cursor;
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        buff.Position = 0;
+                                        using (var streamReader = new StreamReader(buff, Encoding.UTF8))
+                                            ex.Data.Add("data.json", streamReader.ReadToEnd());
+
+                                        throw ex;
+                                    }
+                                }
                             }
+#else
+                            using (var streamReader = new StreamReader(stream, Encoding.UTF8))
+                            using (var jsonReader = new JsonTextReader(streamReader))
+                            {
+                                lock (this.m_cursorLock)
+                                {
+                                    var cursor = this.ParseHtml(Program.JsonSerializer.Deserialize<TApiResult>(jsonReader), setItems, setUsers, !this.m_firstRefresh);
+                                    if (cursor != null)
+                                        this.Cursor = cursor;
+                                }
+                            }
+#endif
                         }
 
                         Task.Factory.StartNew(() =>
                         {
-                            Parallel.ForEach(
-                                setUsers,
-                                new ParallelOptions
-                                {
-                                    CancellationToken = token,
-                                },
-                                user =>
-                                {
-                                    if (this.m_twitterClient.UserCache.IsUpdated(user))
-                                        this.UserUpdatedEvent(user);
-                                });
+                            try
+                            {
+                                Parallel.ForEach(
+                                    setUsers,
+                                    new ParallelOptions
+                                    {
+                                        CancellationToken = token,
+                                    },
+                                    user =>
+                                    {
+                                        if (this.m_twitterClient.UserCache.IsUpdated(user))
+                                            this.UserUpdatedEvent(user);
+                                    });
+                            }
+                            catch
+                            {
+                            }
                         });
 
                         if (!this.m_firstRefresh && setItems.Count > 0)
                         {
                             Task.Factory.StartNew(() =>
                             {
-                                Parallel.ForEach(
-                                    this.m_twitterClient.GetConnections(),
-                                    new ParallelOptions
-                                    {
-                                        CancellationToken = token,
-                                    },
-                                    connection =>
-                                    {
-                                        foreach (var item in setItems)
-                                            connection.SendToStream(item);
-                                    });
+                                try
+                                {
+                                    Parallel.ForEach(
+                                        this.m_twitterClient.GetConnections(),
+                                        new ParallelOptions
+                                        {
+                                            CancellationToken = token,
+                                        },
+                                        connection =>
+                                        {
+                                            foreach (var item in setItems)
+                                                connection.SendToStream(item);
+                                        });
+                                }
+                                catch
+                                {
+                                }
                             });
                         }
                         this.m_firstRefresh = false;
                     }
 
                     return CalcNextRefresh(res.Headers);
+                }
+                catch (JsonSerializationException)
+                {
                 }
                 catch (Exception ex)
                 {

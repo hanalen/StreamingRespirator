@@ -5,7 +5,11 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Security.Authentication;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -14,6 +18,8 @@ using System.Web;
 using Newtonsoft.Json;
 using Sentry;
 using StreamingRespirator.Core.Streaming.Proxy;
+using StreamingRespirator.Core.Streaming.Proxy.Handler;
+using StreamingRespirator.Core.Streaming.Proxy.Streams;
 using StreamingRespirator.Core.Streaming.Twitter;
 using StreamingRespirator.Extensions;
 
@@ -24,32 +30,40 @@ namespace StreamingRespirator.Core.Streaming
     /// </summary>
     internal class RespiratorServer : IDisposable
     {
-        private readonly TcpListener m_tcpListener;
+        private const SslProtocols SslProtocol = SslProtocols.Tls | SslProtocols.Tls11 | SslProtocols.Tls12;
+
+        private readonly CancellationTokenSource m_tunnelCancel = new CancellationTokenSource();
+
+        private readonly Socket m_socketServer;
 
         private readonly Barrier m_connectionsBarrier = new Barrier(0);
-        private readonly LinkedList<TcpClient> m_connections = new LinkedList<TcpClient>();
+        private readonly LinkedList<Socket> m_connections = new LinkedList<Socket>();
 
-        public bool IsRunning { get; private set; }
+        public int Port { get; }
 
-        public RespiratorServer()
+        public RespiratorServer(int port)
         {
-            this.m_tcpListener = new TcpListener(new IPEndPoint(IPAddress.Loopback, Config.Instance.Proxy.Port));
+            this.Port = port;
 
-            if (this.IsRunning)
-                return;
-            this.IsRunning = true;
+            this.m_socketServer = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
 
-            this.m_tcpListener.Start(64);
-            this.m_tcpListener.BeginAcceptTcpClient(this.AcceptClient, null);
+            NativeMethods.SetHandleInformation(this.m_socketServer.Handle, NativeMethods.HANDLE_FLAGS.INHERIT, NativeMethods.HANDLE_FLAGS.NONE);
+
+            this.m_socketServer.Bind(new IPEndPoint(IPAddress.Loopback, Config.Instance.Proxy.Port));
+            this.m_socketServer.Listen(64);
+            this.m_socketServer.BeginAccept(this.AcceptClient, null);
+
+            NetworkChange.NetworkAvailabilityChanged += this.NetworkChange_NetworkAvailabilityChanged;
         }
+
         ~RespiratorServer()
         {
             this.Dispose(false);
         }
         public void Dispose()
         {
-            GC.SuppressFinalize(this);
             this.Dispose(true);
+            GC.SuppressFinalize(this);
         }
 
         private bool m_disposed;
@@ -60,47 +74,64 @@ namespace StreamingRespirator.Core.Streaming
 
             if (disposing)
             {
-                Tunnel.CancelAllTunnel();
+                this.m_tunnelCancel.Cancel();
 
-                this.m_tcpListener.Stop();
+                this.m_socketServer.Close();
 
-                TcpClient[] currentConnections;
-                lock (this.m_connections)
-                {
-                    currentConnections = this.m_connections.ToArray();
-                }
+                this.CloseAllConnections();
 
-                Parallel.ForEach(
-                    currentConnections,
-                    client =>
-                    {
-                        try
-                        {
-                            client.Client.Shutdown(SocketShutdown.Both);
-                            client.Client.Disconnect(false);
-                        }
-                        catch
-                        {
-                        }
-
-                        try
-                        {
-                            client.Close();
-                        }
-                        catch
-                        {
-                        }
-                    });
-
-                try
-                {
-                    this.m_connectionsBarrier.SignalAndWait();
-                }
-                catch
-                {
-                }
+                this.m_tunnelCancel.Dispose();
+                this.m_socketServer.Dispose();
 
                 this.m_connectionsBarrier.Dispose();
+            }
+        }
+
+        private void CloseAllConnections()
+        {
+            Socket[] currentConnections;
+            lock (this.m_connections)
+            {
+                currentConnections = this.m_connections.ToArray();
+            }
+
+            Parallel.ForEach(
+                currentConnections,
+                client =>
+                {
+                    try
+                    {
+                        client.Shutdown(SocketShutdown.Both);
+                        client.Disconnect(false);
+                    }
+                    catch
+                    {
+                    }
+
+                    try
+                    {
+                        client.Close();
+                    }
+                    catch
+                    {
+                    }
+                });
+
+            try
+            {
+                this.m_connectionsBarrier.SignalAndWait(TimeSpan.FromSeconds(5));
+            }
+            catch
+            {
+            }
+        }
+
+        private void NetworkChange_NetworkAvailabilityChanged(object sender, NetworkAvailabilityEventArgs e)
+        {
+            // 모든 커넥션을 닫는다.
+            if (!e.IsAvailable)
+            {
+                this.CloseAllConnections();
             }
         }
 
@@ -108,9 +139,7 @@ namespace StreamingRespirator.Core.Streaming
         {
             try
             {
-                var client = this.m_tcpListener.EndAcceptTcpClient(ar);
-
-                new Thread(this.SocketThread).Start(client);
+                new Thread(this.SocketThread).Start(this.m_socketServer.EndAccept(ar));
             }
             catch (ObjectDisposedException)
             {
@@ -123,7 +152,7 @@ namespace StreamingRespirator.Core.Streaming
             {
                 try
                 {
-                    this.m_tcpListener.BeginAcceptTcpClient(this.AcceptClient, null);
+                    this.m_socketServer.BeginAccept(this.AcceptClient, null);
                 }
                 catch
                 {
@@ -133,37 +162,43 @@ namespace StreamingRespirator.Core.Streaming
 
         private void SocketThread(object socketObject)
         {
-            using (var client = (TcpClient)socketObject)
-            using (var clientStream = client.GetStream())
+            using (var socket = (Socket)socketObject)
+            using (var stream = new NetworkStream(socket))
             {
-                var desc = $"{client.Client.LocalEndPoint} > {client.Client.RemoteEndPoint}";
+                socket.ReceiveTimeout = 30 * 1000;
+                socket.SendTimeout = 30 * 1000;
 
-                LinkedListNode<TcpClient> clientNode;
+                stream.ReadTimeout = 30 * 1000;
+                stream.WriteTimeout = 30 * 1000;
+
+                var desc = $"{socket.LocalEndPoint} > {socket.RemoteEndPoint}";
+
+                LinkedListNode<Socket> socketNode;
 
                 this.m_connectionsBarrier.AddParticipant();
                 lock (this.m_connections)
                 {
-                    clientNode = this.m_connections.AddLast(client);
-                    Debug.WriteLine($"Connected {desc} ({this.m_connections.Count})");
+                    socketNode = this.m_connections.AddLast(socket);
+                    Console.WriteLine($"Connected {desc} ({this.m_connections.Count})");
                 }
 
                 try
                 {
-                    this.SocketThreadSub(clientStream);
+                    using (var proxyStream = new ProxyStream(stream))
+                        this.SocketThreadSub(proxyStream);
                 }
-                catch (Exception ex)
+                catch (Exception)
                 {
-                    SentrySdk.CaptureException(ex);
                 }
 
                 lock (this.m_connections)
                 {
-                    this.m_connections.Remove(clientNode);
-                    Debug.WriteLine($"Disconnected {desc} {this.m_connections.Count}");
+                    this.m_connections.Remove(socketNode);
+                    Console.WriteLine($"Disconnected {desc} {this.m_connections.Count}");
                 }
                 try
                 {
-                    client.Close();
+                    socket.Close();
                 }
                 catch
                 {
@@ -179,30 +214,47 @@ namespace StreamingRespirator.Core.Streaming
             }
         }
 
-        private void SocketThreadSub(Stream clientStream)
+        private void SocketThreadSub(ProxyStream proxyStream)
         {
-            using (var req = ProxyRequest.Parse(clientStream, false))
-            {
-                Tunnel t = null;
+            // https 연결인지, plain 인지 확인하는 과정
+            // ContentType type
+            // https://tools.ietf.org/html/rfc5246#page-41
+            var buff = new byte[1];
+            var read = proxyStream.Peek(buff, 0, buff.Length);
 
+            if (read != buff.Length)
+                throw new NotSupportedException();
+
+            if (buff[0] == 22)
+            {
+                var ssl = new SslStream(proxyStream, false);
+                ssl.AuthenticateAsServer(Certificates.Client, false, SslProtocol, false);
+
+                proxyStream = new ProxyStream(ssl);
+            }
+
+            Handler handler = null;
+
+            if (!ProxyRequest.TryParse(proxyStream, false, out var req))
+                return;
+
+            using (req)
+            {
                 // HTTPS
                 if (req.Method == "CONNECT")
                 {
                     // 호스트 확인하고 처리
-                    var host = req.RemoteHost;
-
-                    switch (host)
+                    switch (req.RemoteHost)
                     {
                         case "userstream.twitter.com":
-                            t = new TunnelSslMitm(req, clientStream, Certificates.Client, this.HostStreaming);
-                            break;
-
                         case "api.twitter.com":
-                            t = new TunnelSslMitm(req, clientStream, Certificates.Client, this.HostAPI);
+                        case "localhost":
+                        case "127.0.0.1":
+                            handler = new TunnelSslMitm(proxyStream, this.m_tunnelCancel.Token, Certificates.Client, SslProtocol, this.HandleContext);
                             break;
 
                         default:
-                            t = new TunnelSslForward(req, clientStream);
+                            handler = new TunnelSslForward(proxyStream, this.m_tunnelCancel.Token);
                             break;
                     }
                 }
@@ -210,15 +262,81 @@ namespace StreamingRespirator.Core.Streaming
                 // HTTP
                 else
                 {
-                    t = new TunnelPlain(req, clientStream);
+                    // 호스트 확인하고 처리
+                    switch (req.RemoteHost)
+                    {
+                        case "localhost":
+                        case "127.0.0.1":
+                            handler = new HandlerPlain(proxyStream, this.m_tunnelCancel.Token, this.HandleContext);
+                            break;
+
+                        default:
+                            handler = new TunnelPlain(proxyStream, this.m_tunnelCancel.Token);
+                            break;
+                    }
                 }
 
-                using (t)
-                    t.Handle();
+                using (handler)
+                    handler.Handle(req);
             }
         }
 
-        private bool HostStreaming(ProxyContext ctx)
+        private void HandleContext(ProxyContext ctx)
+        {
+            if (!ctx.CheckAuthentication())
+                return;
+
+            switch (ctx.Request.RequestUri.Host)
+            {
+                case "userstream.twitter.com":
+                    this.HostStreaming(ctx);
+                    break;
+
+                case "api.twitter.com":
+                    this.HostAPI(ctx);
+                    break;
+
+                case "localhost":
+                case "127.0.0.1":
+                    this.HostLocalhost(ctx);
+                    break;
+            }
+        }
+
+        private void HostLocalhost(ProxyContext ctx)
+        {
+            if (TrimHost("userstream.twitter.com"))
+            {
+                this.HostStreaming(ctx);
+                return;
+            }
+
+            if (TrimHost("api.twitter.com"))
+            {
+                this.HostAPI(ctx);
+                return;
+            }
+
+            ctx.Response.StatusCode = HttpStatusCode.BadRequest;
+
+            bool TrimHost(string host)
+            {
+                if (ctx.Request.RequestUri.AbsolutePath.StartsWith($"/{host}/"))
+                {
+                    ctx.Request.RequestUri = new UriBuilder(ctx.Request.RequestUri)
+                    {
+                        Host = host,
+                        Path = ctx.Request.RequestUri.AbsolutePath.Substring(host.Length + 1),
+                    }.Uri;
+
+                    return true;
+                }
+
+                return false;
+            }
+        }
+
+        private void HostStreaming(ProxyContext ctx)
         {
             var desc = $"{ctx.Request.RequestUri}";
             Debug.WriteLine($"streaming connected : {desc}");
@@ -226,27 +344,26 @@ namespace StreamingRespirator.Core.Streaming
             if (!ctx.Request.RequestUri.AbsolutePath.Equals("/1.1/user.json", StringComparison.OrdinalIgnoreCase))
             {
                 ctx.Response.StatusCode = HttpStatusCode.NotFound;
-                return true;
+                return;
             }
 
             if (!TryGetOwnerId(ctx.Request.RequestUri, ctx.Request.Headers, null, out var ownerId))
             {
                 ctx.Response.StatusCode = HttpStatusCode.Unauthorized;
-                return true;
+                return;
             }
 
             var twitterClient = TwitterClientFactory.GetClient(ownerId);
             if (twitterClient == null)
             {
                 ctx.Response.StatusCode = HttpStatusCode.Unauthorized;
-                return true;
+                return;
             }
 
             ctx.Response.StatusCode = HttpStatusCode.OK;
 
             ctx.Response.Headers.Set("Content-type", "application/json; charset=utf-8");
             ctx.Response.Headers.Set("Connection", "close");
-            ctx.Response.SetChunked();
 
             using (var sc = new StreamingConnection(new WaitableStream(ctx.Response.ResponseStream), twitterClient))
             {
@@ -258,11 +375,9 @@ namespace StreamingRespirator.Core.Streaming
             }
 
             Debug.WriteLine($"streaming disconnected : {desc}");
-
-            return true;
         }
 
-        private bool HostAPI(ProxyContext ctx)
+        private void HostAPI(ProxyContext ctx)
         {
             switch (ctx.Request.RequestUri.AbsolutePath)
             {
@@ -271,24 +386,29 @@ namespace StreamingRespirator.Core.Streaming
                 // POST https://api.twitter.com/1.1/statuses/unretweet/:id.json
                 case string path when path.StartsWith("/1.1/statuses/destroy/", StringComparison.OrdinalIgnoreCase) ||
                                       path.StartsWith("/1.1/statuses/unretweet/", StringComparison.OrdinalIgnoreCase):
-                    return HandleDestroyOrUnretweet(ctx);
+                    if (HandleDestroyOrUnretweet(ctx))
+                        return;
+                    break;
 
                 // api 호출 후 스트리밍에 리트윗 날려주는 함수
                 // 404 : id = 삭제된 트윗일 수 있음
                 // 200 : 성공시 스트리밍에 전송해서 한번 더 띄우도록
                 // POST https://api.twitter.com/1.1/statuses/retweet/:id.json
                 case string path when path.StartsWith("/1.1/statuses/retweet/", StringComparison.OrdinalIgnoreCase):
-                    return HandleRetweet(ctx);
+                    if (HandleRetweet(ctx))
+                        return;
+                    break;
 
                 // d @ID 로 DM 보내는 기능 추가된 함수.
                 // 401 : in_reply_to_status_id = 삭제된 트윗일 수 있음
                 // POST https://api.twitter.com/1.1/statuses/update.json
                 case string path when path.Equals("/1.1/statuses/update.json", StringComparison.OrdinalIgnoreCase):
-                    return HandleUpdate(ctx);
-
-                default:
-                    return HandleTunnel(ctx);
+                    if (HandleUpdate(ctx))
+                        return;
+                    break;
             }
+
+            HandleTunnel(ctx);
         }
 
         private static bool HandleDestroyOrUnretweet(ProxyContext ctx)
@@ -405,6 +525,9 @@ namespace StreamingRespirator.Core.Streaming
                     }
                 }
             }
+            catch (WebException)
+            {
+            }
             catch (Exception ex)
             {
                 SentrySdk.CaptureException(ex);
@@ -486,18 +609,15 @@ namespace StreamingRespirator.Core.Streaming
             return true;
         }
 
-        private static bool HandleTunnel(ProxyContext ctx)
+        private static void HandleTunnel(ProxyContext ctx)
         {
-            if (!TryGetTwitterClient(ctx, null, out var twitClient))
-                return false;
+            TryGetTwitterClient(ctx, null, out var twitClient);
 
             if (!TryCallAPIThenSetContext(ctx, null, twitClient, null, out _, out _))
             {
+                ctx.Response.Headers.Clear();
                 ctx.Response.StatusCode = HttpStatusCode.InternalServerError;
-                return true;
             }
-
-            return true;
         }
 
         private static bool TryGetOwnerId(Uri uri, WebHeaderCollection authorizationValue, string body, out long ownerId)
@@ -597,7 +717,7 @@ namespace StreamingRespirator.Core.Streaming
 
         private static HttpWebResponse CallAPI(ProxyContext ctx, Stream proxyReqBody, TwitterClient client)
         {
-            var reqHttp = ctx.Request.CreateRequest((method, uri) => client?.Credential.CreateReqeust(method, uri), client == null);
+            var reqHttp = ctx.Request.CreateRequest(client?.Credential.CreateReqeust(ctx.Request.Method, ctx.Request.RequestUri), client == null);
 
             if (proxyReqBody == null)
             {
@@ -624,8 +744,6 @@ namespace StreamingRespirator.Core.Streaming
             {
                 if (webEx.Response != null)
                     resHttp = webEx.Response as HttpWebResponse;
-                else
-                    SentrySdk.CaptureException(webEx);
             }
             catch (Exception ex)
             {
@@ -679,6 +797,20 @@ namespace StreamingRespirator.Core.Streaming
 
             ctx.Response.StatusCode = statusCode;
             return true;
+        }
+
+        private static class NativeMethods
+        {
+            [DllImport("kernel32.dll")]
+            public static extern bool SetHandleInformation(IntPtr hObject, HANDLE_FLAGS dwMask, HANDLE_FLAGS dwFlags);
+
+            [Flags]
+            public enum HANDLE_FLAGS : uint
+            {
+                NONE = 0,
+                INHERIT = 1,
+                PROTECT_FROM_CLOSE = 2
+            }
         }
     }
 }
